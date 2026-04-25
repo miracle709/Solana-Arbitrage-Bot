@@ -1,189 +1,201 @@
 import "dotenv/config";
 import { getKeypairFromEnvironment } from "@solana-developers/helpers";
 import axios from "axios";
+import bs58 from "bs58";
 import {
+    AddressLookupTableAccount,
     Connection,
     PublicKey,
-    VersionedTransaction,
-    TransactionMessage,
     SystemProgram,
+    VersionedTransaction,
     ComputeBudgetProgram,
-    TransactionInstruction,
-} from '@solana/web3.js';
-import { Buffer } from 'buffer';
-import bs58 from 'bs58';
+    TransactionMessage,
+    type TransactionInstruction,
+} from "@solana/web3.js";
+import { config } from "./config";
+import { type JupiterQuote, toTransactionInstruction, type SwapInstructionsResponse } from "./types";
 
-// wallet
 const payer = getKeypairFromEnvironment("SECRET_KEY");
-console.log('payer:', payer.publicKey.toBase58())
+console.log("payer:", payer.publicKey.toBase58());
 
-const connection = new Connection('https://mainnet-ams.chainbuff.com', 'processed');
-const quoteUrl = 'http://127.0.0.1:8080/quote';
-const swapInstructionUrl = 'http://127.0.0.1:8080/swap-instructions';
+const connection = new Connection(config.solanaRpcUrl, "processed");
 
-// WSOL and USDC mint address
-const wSolMint = 'So11111111111111111111111111111111111111112';
-const usdcMint = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+function buildQuoteParams(
+    inputMint: string,
+    outputMint: string,
+    amount: number,
+    inAmountForSecondLeg?: number
+): Record<string, string | number | boolean> {
+    const q: Record<string, string | number | boolean> = {
+        inputMint,
+        outputMint,
+        amount: inAmountForSecondLeg !== undefined ? inAmountForSecondLeg : amount,
+        onlyDirectRoutes: false,
+        slippageBps: config.slippageBps,
+        maxAccounts: config.maxAccounts,
+    };
+    return q;
+}
 
-function instructionFormat(instruction) {
+function buildMergedQuote(
+    quote0: JupiterQuote,
+    quote1: JupiterQuote,
+    baseAmount: number,
+    jitoTip: number
+): JupiterQuote {
     return {
-        programId: new PublicKey(instruction.programId),
-        keys: instruction.accounts.map(account => ({
-            pubkey: new PublicKey(account.pubkey),
-            isSigner: account.isSigner,
-            isWritable: account.isWritable
-        })),
-        data: Buffer.from(instruction.data, 'base64')
+        ...quote0,
+        outputMint: quote1.outputMint,
+        outAmount: String(baseAmount + jitoTip),
+        otherAmountThreshold: String(baseAmount + jitoTip),
+        priceImpactPct: "0",
+        routePlan: [...(quote0.routePlan ?? []), ...(quote1.routePlan ?? [])],
     };
 }
 
-async function run() {
+async function loadAddressLookupTableAccounts(
+    addrs: string[]
+): Promise<AddressLookupTableAccount[]> {
+    const results = await Promise.all(
+        addrs.map((address) => connection.getAddressLookupTable(new PublicKey(address)))
+    );
+    return results.map((r) => r.value).filter((a): a is AddressLookupTableAccount => a != null);
+}
 
+function assertSwapResponse(data: unknown): asserts data is SwapInstructionsResponse {
+    const o = data as Record<string, unknown> | null;
+    if (o == null) {
+        throw new Error("swap-instructions: empty body");
+    }
+    if (typeof o.computeUnitLimit !== "number") {
+        throw new Error("swap-instructions: missing computeUnitLimit");
+    }
+    if (!Array.isArray(o.setupInstructions) || o.swapInstruction == null) {
+        throw new Error("swap-instructions: missing instructions");
+    }
+    if (!Array.isArray(o.addressLookupTableAddresses)) {
+        throw new Error("swap-instructions: missing addressLookupTableAddresses");
+    }
+}
+
+async function runOneCycle(): Promise<void> {
     const start = Date.now();
+    const base = config.tradeSizeLamports;
 
-    // quote0: WSOL -> USDC
-    const quote0Params = {
-        inputMint: wSolMint,
-        outputMint: usdcMint,
-        amount: 10000000, // 0.01 WSOL
-        onlyDirectRoutes: false,
-        slippageBps: 0,
-        maxAccounts: 20,
+    const quote0Params = buildQuoteParams(
+        config.wSolMint,
+        config.usdcMint,
+        base
+    );
+    const { data: q0 } = await axios.get<JupiterQuote>(config.jupiter.quoteUrl, { params: quote0Params });
+    const leg1Out = Number(q0.outAmount);
+    if (!Number.isFinite(leg1Out) || leg1Out <= 0) {
+        return;
+    }
+
+    const quote1Params = buildQuoteParams(config.usdcMint, config.wSolMint, base, leg1Out);
+    const { data: q1 } = await axios.get<JupiterQuote>(config.jupiter.quoteUrl, { params: quote1Params });
+    const leg2Out = Number(q1.outAmount);
+    if (!Number.isFinite(leg2Out)) {
+        return;
+    }
+
+    const diffLamports = leg2Out - base;
+    console.log("diffLamports:", diffLamports);
+    if (diffLamports <= config.minProfitLamports) {
+        return;
+    }
+
+    const jitoTip = Math.floor(diffLamports * config.jitoTipFraction);
+    const merged = buildMergedQuote(q0, q1, base, jitoTip);
+
+    const swapData = {
+        userPublicKey: payer.publicKey.toBase58(),
+        wrapAndUnwrapSol: false,
+        useSharedAccounts: false,
+        computeUnitPriceMicroLamports: 1,
+        dynamicComputeUnitLimit: true,
+        skipUserAccountsRpcCalls: true,
+        quoteResponse: merged,
     };
-    const quote0Resp = await axios.get(quoteUrl, { params: quote0Params })
 
-    // quote1: USDC -> WSOL
-    const quote1Params = {
-        inputMint: usdcMint,
-        outputMint: wSolMint,
-        amount: quote0Resp.data.outAmount,
-        onlyDirectRoutes: false,
-        slippageBps: 0,
-        maxAccounts: 20,
-    };
-    const quote1Resp = await axios.get(quoteUrl, { params: quote1Params })
+    const { data: swapInstructions } = await axios.post<unknown>(
+        config.jupiter.swapInstructionUrl,
+        swapData
+    );
+    assertSwapResponse(swapInstructions);
+    const swap: SwapInstructionsResponse = swapInstructions;
 
-    // profit but not real
-    const diffLamports = (quote1Resp.data.outAmount - quote0Params.amount);
-    console.log('diffLamports:', diffLamports)
-    const jitoTip = Math.floor(diffLamports * 0.5)
+    const ixs: TransactionInstruction[] = [];
 
-    // threhold
-    const thre = 3000
-    if (diffLamports > thre) {
+    ixs.push(
+        ComputeBudgetProgram.setComputeUnitLimit({
+            units: swap.computeUnitLimit,
+        })
+    );
 
-        // merge quote0 and quote1 response
-        let mergedQuoteResp = quote0Resp.data;
-        mergedQuoteResp.outputMint = quote1Resp.data.outputMint;
-        mergedQuoteResp.outAmount = String(quote0Params.amount + jitoTip);
-        mergedQuoteResp.otherAmountThreshold = String(quote0Params.amount + jitoTip);
-        mergedQuoteResp.priceImpactPct = "0";
-        mergedQuoteResp.routePlan = mergedQuoteResp.routePlan.concat(quote1Resp.data.routePlan)
+    ixs.push(
+        ...swap.setupInstructions.map((raw) => toTransactionInstruction(raw))
+    );
 
-        // swap
-        let swapData = {
-            "userPublicKey": payer.publicKey.toBase58(),
-            "wrapAndUnwrapSol": false,
-            "useSharedAccounts": false,
-            "computeUnitPriceMicroLamports": 1,
-            "dynamicComputeUnitLimit": true,
-            "skipUserAccountsRpcCalls": true,
-            "quoteResponse": mergedQuoteResp
-        }
-        const instructionsResp = await axios.post(swapInstructionUrl, swapData);
-        const instructions = instructionsResp.data;
+    ixs.push(toTransactionInstruction(swap.swapInstruction));
 
-        // bulid tx
-        let ixs: TransactionInstruction[] = [];
-
-        // 1. cu
-        const computeUnitLimitInstruction = ComputeBudgetProgram.setComputeUnitLimit({
-            units: instructions.computeUnitLimit,
-        });
-        ixs.push(computeUnitLimitInstruction);
-
-        // 2. setup
-        const setupInstructions = instructions.setupInstructions.map(instructionFormat);
-        ixs = ixs.concat(setupInstructions);
-
-        // 3. save balance instruction from your program
-
-        // 4. swap
-        const swapInstructions = instructionFormat(instructions.swapInstruction);
-        ixs.push(swapInstructions);
-
-        // 5. cal real profit and pay for jito from your program
-        // a simple transfer instruction here
-        // the real profit and tip should be calculated in your program
-        const tipInstruction = SystemProgram.transfer({
+    ixs.push(
+        SystemProgram.transfer({
             fromPubkey: payer.publicKey,
-            toPubkey: new PublicKey('Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY'), // a random account from jito tip accounts
+            toPubkey: new PublicKey(config.jitoTipReceiver),
             lamports: jitoTip,
         })
-        ixs.push(tipInstruction);
+    );
 
-        // ALT
-        const addressLookupTableAccounts = await Promise.all(
-            instructions.addressLookupTableAddresses.map(async (address) => {
-                const result = await connection.getAddressLookupTable(new PublicKey(address));
-                return result.value;
-            })
-        );
+    const addressLookupTableAccounts = await loadAddressLookupTableAccounts(
+        swap.addressLookupTableAddresses
+    );
 
-        // v0 tx
-        const { blockhash } = await connection.getLatestBlockhash();
-        const messageV0 = new TransactionMessage({
-            payerKey: payer.publicKey,
-            recentBlockhash: blockhash,
-            instructions: ixs,
-        }).compileToV0Message(addressLookupTableAccounts);
-        const transaction = new VersionedTransaction(messageV0);
-        transaction.sign([payer]);
+    const { blockhash } = await connection.getLatestBlockhash();
+    const messageV0 = new TransactionMessage({
+        payerKey: payer.publicKey,
+        recentBlockhash: blockhash,
+        instructions: ixs,
+    }).compileToV0Message(addressLookupTableAccounts);
 
-        // simulate
-        // const simulationResult = await connection.simulateTransaction(transaction);
-        // console.log(JSON.stringify(simulationResult));
+    const transaction = new VersionedTransaction(messageV0);
+    transaction.sign([payer]);
 
-        // send bundle
-        const serializedTransaction = transaction.serialize();
-        const base58Transaction = bs58.encode(serializedTransaction);
+    const serializedTransaction = transaction.serialize();
+    const base58Transaction = bs58.encode(serializedTransaction);
 
-        const bundle = {
-            jsonrpc: "2.0",
-            id: 1,
-            method: "sendBundle",
-            params: [[base58Transaction]]
-        };
+    const bundle = {
+        jsonrpc: "2.0" as const,
+        id: 1,
+        method: "sendBundle" as const,
+        params: [[base58Transaction]] as [string[]],
+    };
 
-        const bundle_resp = await axios.post(`https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles`, bundle, {
-            headers: {
-                'Content-Type': 'application/json'
-            }
-        });
-        const bundle_id = bundle_resp.data.result
-        console.log(`sent to frankfurt, bundle id: ${bundle_id}`)
+    const bundleResp = await axios.post<{ result?: string }>(config.jitoBundleUrl, bundle, {
+        headers: { "Content-Type": "application/json" },
+    });
+    console.log(`sent to Jito, bundle id: ${bundleResp.data?.result}`);
 
-        // cal time cost
-        const end = Date.now();
-        const duration = end - start;
+    const end = Date.now();
+    console.log(`${config.wSolMint} - ${config.usdcMint}`);
+    console.log(
+        `slot: ${String(merged.contextSlot)}, total duration: ${end - start}ms`
+    );
+}
 
-        console.log(`${wSolMint} - ${usdcMint}`)
-        console.log(`slot: ${mergedQuoteResp.contextSlot}, total duration: ${duration}ms`)
+async function main(): Promise<void> {
+    for (;;) {
+        try {
+            await runOneCycle();
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.error("cycle error:", msg);
+        }
+        await wait(config.pollIntervalMs);
     }
 }
 
-async function main() {
-
-    while(1) {
-
-        await run();
-
-        // wait 200ms
-        await wait(200);
-    }
-    
-}
-
-main()
+void main();
